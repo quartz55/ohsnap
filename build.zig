@@ -9,32 +9,12 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const optimize = b.standardOptimizeOption(.{});
 
-    const options = b.addOptions();
-
-    const mod_names: []const []const u8 = b.option(
-        []const []const u8,
-        "module_name",
-        "Name of a module with a non-standard directory.",
-    ) orelse &.{};
-
-    options.addOption([]const []const u8, "module_name", mod_names);
-
-    const mod_dirs: []const []const u8 = b.option(
-        []const []const u8,
-        "root_directory",
-        "Non-standard directory in which the corresponding `module_name` is found (relative to repo).",
-    ) orelse &.{};
-
-    options.addOption([]const []const u8, "root_directory", mod_dirs);
-
     // Export as module to be available for @import("ohsnap") on user site
     const snap_module = b.addModule("ohsnap", .{
         .root_source_file = b.path("src/ohsnap.zig"),
         .target = target,
         .optimize = optimize,
     });
-
-    snap_module.addOptions("config", options);
 
     const test_filters = b.option(
         []const []const u8,
@@ -48,8 +28,6 @@ pub fn build(b: *std.Build) void {
         .root_module = snap_module,
         .filters = test_filters,
     });
-
-    lib_unit_tests.root_module.addOptions("config", options);
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 

@@ -7,7 +7,6 @@
 //! diffz[^3].  Last, but not least, for the regex library: the Minimum
 //! Viable Zig Regex[^4].
 //!
-//!
 //! [^1]: https://github.com/tigerbeetle/tigerbeetle/blob/main/src/testing/snaptest.zig.
 //! [^2]: https://github.com/timfayz/pretty
 //! [^3]: https://github.com/ziglibs/diffz
@@ -15,14 +14,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const config = @import("config");
 const pretty = @import("pretty");
 const diffz = @import("diffz");
 const mvzr = @import("mvzr");
 const testing = std.testing;
 
 const assert = std.debug.assert;
-const SourceLocation = std.builtin.SourceLocation;
 
 const Diff = @TypeOf(diffz.Diff.default.edits);
 const Edit = diffz.Edit;
@@ -33,13 +30,6 @@ const UserRegex = mvzr.SizedRegex(128, 16);
 // Intended for use in test mode only.
 comptime {
     assert(builtin.is_test);
-}
-
-// Number of entries in config must be even (module root, directory)
-comptime {
-    if (config.module_name.len != config.root_directory.len) {
-        @compileError("Every module_name must have a corresponding root_directory.");
-    }
 }
 
 /// OhSnap specialized to use the default options.
@@ -56,24 +46,29 @@ pub const default_pretty_options = pretty.Options{
     .show_tree_lines = true,
 };
 
+/// Builds a snapshot type which formats values with `pretty_options`.
+///
+/// The test binary must contain debug info, so build tests in Debug mode.
+/// The update logic uses the debug info to find the source file.
 pub fn OhSnap(comptime pretty_options: pretty.Options) type {
     return struct {
-        /// Creates a new Snap using `pretty` formatting.
+        /// Starts a snapshot which holds `text`.
         ///
-        /// For the update logic to work, *must* be formatted as:
+        /// Write the snap text as a multi-line string. The text must start on
+        /// the line below the call:
         ///
         /// ```
-        /// try oh.snap(@src(), // This can be on the next line
+        /// try oh.snap(
         ///     \\Text of the snapshot.
         /// ).expectEqual(val);
         /// ```
         ///
-        /// With the `@src()` on the line before the text, which must be
-        /// in multi-line format.
-        pub fn snap(location: SourceLocation, text: []const u8) Snap(pretty_options) {
+        /// `snap` records the return address of its caller. The update logic
+        /// resolves that address to the source file and line.
+        pub fn snap(text: []const u8) Snap(pretty_options) {
             return .{
-                .location = location,
                 .text = text,
+                .return_address = @returnAddress(),
             };
         }
     };
@@ -85,8 +80,10 @@ const regex_finder = mvzr.compile(ignore_regex_string).?;
 
 pub fn Snap(comptime pretty_options: pretty.Options) type {
     return struct {
-        location: SourceLocation,
         text: []const u8,
+        /// Address inside the caller of `snap`. The update logic resolves it to
+        /// a source file and line.
+        return_address: usize,
 
         const Self = @This();
         const allocator = std.testing.allocator;
@@ -173,20 +170,7 @@ pub fn Snap(comptime pretty_options: pretty.Options) type {
                 );
                 defer allocator.free(diff_string);
                 const differs = if (test_it) " differs" else "";
-                std.debug.print(
-                    \\Snapshot on line {s}{d}{s}{s}:
-                    \\
-                    \\{s}
-                    \\
-                ,
-                    .{
-                        "\x1b[33m",
-                        snapshot.location.line + 1,
-                        "\x1b[m",
-                        differs,
-                        diff_string,
-                    },
-                );
+                printSnapshotHeader(snapshot.return_address, differs, diff_string);
                 if (test_it) {
                     if (snapshot.text.len == 0 or snapshot.text.len == 1 and snapshot.text[0] == '\n') {
                         std.debug.print("your snap:", .{});
@@ -208,45 +192,51 @@ pub fn Snap(comptime pretty_options: pretty.Options) type {
             defer arena.deinit();
 
             const arena_allocator = arena.allocator();
-            var threaded_io: std.Io.Threaded = .init_single_threaded;
-            defer threaded_io.deinit();
-            const io = threaded_io.io();
+            const io = std.Options.debug_io;
 
-            var maybe_dir_str: ?[]const u8 = null;
-            {
-                var i: usize = 0;
-                while (i < config.module_name.len) : (i += 1) {
-                    if (std.mem.eql(u8, config.module_name[i], snapshot.location.module)) {
-                        maybe_dir_str = config.root_directory[i];
-                        break;
-                    }
-                }
-            }
+            const call_site = resolveCallSite(snapshot.return_address, arena_allocator) catch |err| {
+                printUpdateFailure(err);
+                return err;
+            };
+            const file_name = call_site.file_name;
 
-            const dir_str = maybe_dir_str orelse "src";
+            // Updates which already ran in this process changed the file. The
+            // compiled line stays fixed, so correct it by the recorded shifts.
+            const shifted = @as(i64, @intCast(call_site.line)) + shifts.lineDelta(file_name, call_site.line);
+            const adjusted_line: u64 = @intCast(@max(shifted, 1));
 
-            var mod_dir = std.Io.Dir.cwd().openDir(io, dir_str, .{}) catch |err| {
-                std.debug.print("Problem opening directory {s}, bailing out\n", .{dir_str});
+            const dir_path = std.fs.path.dirname(file_name) orelse ".";
+            const base_name = std.fs.path.basename(file_name);
+
+            var mod_dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch |err| {
+                std.debug.print("Problem opening directory {s}, bailing out\n", .{dir_path});
                 return err;
             };
             defer mod_dir.close(io);
 
             const file_text =
-                mod_dir.readFileAlloc(io, snapshot.location.file, arena_allocator, .limited(1024 * 1024)) catch |err| {
-                    std.debug.print("Problem opening file {s}, bailing out\n", .{snapshot.location.file});
+                mod_dir.readFileAlloc(io, base_name, arena_allocator, .limited(1024 * 1024)) catch |err| {
+                    std.debug.print("Problem opening file {s}, bailing out\n", .{file_name});
                     return err;
                 };
-            var file_text_updated = try std.ArrayList(u8).initCapacity(arena_allocator, file_text.len);
 
-            const line_zero_based = snapshot.location.line - 1;
-            const range = try snapRange(file_text, line_zero_based);
-
-            const snapshot_prefix = file_text[0..range.start];
+            const range = try snapshotRange(file_text, adjusted_line);
             const snapshot_text = file_text[range.start..range.end];
-            const snapshot_suffix = file_text[range.end..];
-            const indent = getIndent(snapshot_text);
+            if (!blockMatches(snapshot_text, snapshot.text)) {
+                std.debug.print(
+                    \\The snapshot at {s}:{d} does not match the file text.
+                    \\Run the tests again. A previous update may have changed the file.
+                    \\
+                , .{ file_name, call_site.line });
+                return error.SnapshotMismatch;
+            }
 
-            try file_text_updated.appendSlice(arena_allocator, snapshot_prefix);
+            const indent = getIndent(snapshot_text);
+            const old_lines = std.mem.count(u8, snapshot_text, "\n");
+            const new_lines = std.mem.count(u8, got, "\n") + 1;
+
+            var file_text_updated = try std.ArrayList(u8).initCapacity(arena_allocator, file_text.len);
+            try file_text_updated.appendSlice(arena_allocator, file_text[0..range.start]);
             {
                 var allocating = std.Io.Writer.Allocating.fromArrayList(arena_allocator, &file_text_updated);
                 defer file_text_updated = allocating.toArrayList();
@@ -255,14 +245,20 @@ pub fn Snap(comptime pretty_options: pretty.Options) type {
                     try allocating.writer.print("{s}\\\\{s}\n", .{ indent, line });
                 }
             }
-            try file_text_updated.appendSlice(arena_allocator, snapshot_suffix);
+            try file_text_updated.appendSlice(arena_allocator, file_text[range.end..]);
 
             try mod_dir.writeFile(io, .{
-                .sub_path = snapshot.location.file,
+                .sub_path = base_name,
                 .data = file_text_updated.items,
             });
 
-            std.debug.print("Updated {s}\n", .{snapshot.location.file});
+            try shifts.record(
+                file_name,
+                call_site.line,
+                @as(i64, @intCast(new_lines)) - @as(i64, @intCast(old_lines)),
+            );
+
+            std.debug.print("Updated {s}:{d}\n", .{ file_name, call_site.line });
             return error.SnapUpdated;
         }
 
@@ -405,7 +401,6 @@ pub fn Snap(comptime pretty_options: pretty.Options) type {
                 got_idx = got_end;
             }
             try new_got.appendSlice(allocator, got[got_idx..]);
-            return try updateSnap(snapshot, new_got.items);
         }
 
         fn dupe(d: Edit) !Edit {
@@ -413,6 +408,132 @@ pub fn Snap(comptime pretty_options: pretty.Options) type {
         }
     };
 }
+
+const CallSite = struct {
+    file_name: []const u8,
+    line: u64,
+};
+
+/// Resolves an address to a source file and line with the debug info of the
+/// test binary. `file_name` is allocated with `allocator`.
+fn resolveCallSite(address: usize, allocator: std.mem.Allocator) !CallSite {
+    const io = std.Options.debug_io;
+    const debug_info = try std.debug.getSelfDebugInfo();
+
+    var text_arena: std.heap.ArenaAllocator = .init(std.debug.getDebugInfoAllocator());
+    defer text_arena.deinit();
+
+    var fallback = std.heap.stackFallback(
+        @sizeOf(std.debug.Symbol) + @alignOf(std.debug.Symbol) - 1,
+        std.debug.getDebugInfoAllocator(),
+    );
+    const symbol_allocator = fallback.get();
+    var symbols = try std.ArrayList(std.debug.Symbol).initCapacity(symbol_allocator, 1);
+    defer symbols.deinit(symbol_allocator);
+
+    // The return address is after the call instruction. Step back one byte
+    // into the call, so the line table reports the call site line.
+    const call_address = address -| 1;
+    try debug_info.getSymbols(io, symbol_allocator, text_arena.allocator(), call_address, false, &symbols);
+    for (symbols.items) |symbol| {
+        if (symbol.source_location) |location| {
+            return .{
+                .file_name = try allocator.dupe(u8, location.file_name),
+                .line = location.line,
+            };
+        }
+    }
+    return error.NoSourceLocation;
+}
+
+fn printSnapshotHeader(return_address: usize, differs: []const u8, diff_string: []const u8) void {
+    var arena: std.heap.ArenaAllocator = .init(std.debug.getDebugInfoAllocator());
+    defer arena.deinit();
+
+    const call_site = resolveCallSite(return_address, arena.allocator()) catch {
+        std.debug.print(
+            \\Snapshot at an unknown location{s}:
+            \\
+            \\{s}
+            \\
+        , .{ differs, diff_string });
+        return;
+    };
+
+    std.debug.print(
+        \\Snapshot at {s}{s}:{d}{s}{s}:
+        \\
+        \\{s}
+        \\
+    , .{
+        "\x1b[33m",
+        call_site.file_name,
+        call_site.line,
+        "\x1b[m",
+        differs,
+        diff_string,
+    });
+}
+
+fn printUpdateFailure(err: anyerror) void {
+    std.debug.print(
+        \\OhSnap cannot update this snapshot.
+        \\The return address of the snap call does not resolve to a source file ({s}).
+        \\Snapshot updates need debug info. Build the tests in Debug mode and run again.
+        \\
+    , .{@errorName(err)});
+}
+
+const Shift = struct {
+    /// One-based line of the snap call in the compiled source.
+    line: u64,
+    /// Line count difference of the update.
+    delta: i64,
+};
+
+/// Tracks the line shifts which updates applied earlier in this test process.
+/// The source line of a snap stays fixed at compile time, but each update
+/// changes the file. A later update corrects its line with these values, so one
+/// test run can update any number of snapshots.
+const ShiftTracker = struct {
+    const Shifts = std.ArrayListUnmanaged(Shift);
+    const Tracker = std.StringHashMapUnmanaged(Shifts);
+
+    map: Tracker = .empty,
+
+    fn lineDelta(self: *const ShiftTracker, path: []const u8, line: u64) i64 {
+        var total: i64 = 0;
+        if (self.map.get(path)) |entries| {
+            for (entries.items) |shift| {
+                if (shift.line < line) total += shift.delta;
+            }
+        }
+        return total;
+    }
+
+    fn record(self: *ShiftTracker, path: []const u8, line: u64, delta: i64) !void {
+        const a = std.heap.page_allocator;
+        const entry = try self.map.getOrPut(a, path);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = try a.dupe(u8, path);
+            entry.value_ptr.* = .empty;
+        }
+        try entry.value_ptr.append(a, .{ .line = line, .delta = delta });
+    }
+
+    fn deinit(self: *ShiftTracker) void {
+        const a = std.heap.page_allocator;
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            a.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(a);
+        }
+        self.map.deinit(a);
+        self.* = .{};
+    }
+};
+
+var shifts: ShiftTracker = .{};
 
 /// Answer whether the diffs differ (pre-regex, if any)
 fn diffDiffers(diffs: Diff) bool {
@@ -437,64 +558,73 @@ fn deinitDiffList(allocator: std.mem.Allocator, diffs: *Diff) void {
 
 const Range = struct { start: usize, end: usize };
 
-/// Extracts the range of the snapshot. Assumes that the snapshot is formatted as
+/// Returns the byte range of the snapshot text which starts on the line below
+/// the `snap` call. `call_line` is the one-based line of the call.
 ///
 /// ```
-/// oh.snap(@src(),
+/// try oh.snap(
 ///     \\first line
 ///     \\second line
 /// ).expectEqual(val);
 /// ```
-///
-/// or
-///
-/// ```
-/// oh.snap(
-/// @src(),
-///     \\first line
-///     \\second line
-/// ).expectEqual(val);
-/// ```
-///
-/// In the event that a file is modified, we fail the test with a (hopefully informative)
-/// error.
-fn snapRange(text: []const u8, src_line: u32) !Range {
+fn snapshotRange(text: []const u8, call_line: u64) !Range {
     var offset: usize = 0;
-    var line_number: u32 = 0;
+    var line_number: u64 = 0;
 
+    // The multi-line string starts one line below the call. A zero-based line
+    // number equal to the one-based call line addresses that line.
+    var start: ?usize = null;
     var lines = std.mem.splitScalar(u8, text, '\n');
-    const snap_start = while (lines.next()) |line| : (line_number += 1) {
-        if (line_number == src_line) {
-            if (std.mem.indexOf(u8, line, "@src()") == null) {
-                std.debug.print(
-                    "Expected snapshot @src() on line {d}.  Try running tests again.\n",
-                    .{line_number + 1},
-                );
-                try testing.expect(false);
-            }
-        }
-        if (line_number == src_line + 1) {
+    while (lines.next()) |line| : (line_number += 1) {
+        if (line_number == call_line) {
             if (!isMultilineString(line)) {
                 std.debug.print(
-                    "Expected multiline string `\\\\` on line {d}.\n",
+                    "Expected the snapshot string on line {d}.  Try running tests again.\n",
                     .{line_number + 1},
                 );
                 try testing.expect(false);
             }
-            break offset;
+            start = offset;
+            break;
         }
         offset += line.len + 1; // 1 for \n
-    } else unreachable;
+    }
+    const snap_start = start orelse {
+        std.debug.print("No snapshot string found at line {d}.  Try running tests again.\n", .{call_line});
+        return error.SnapshotNotFound;
+    };
 
     lines = std.mem.splitScalar(u8, text[snap_start..], '\n');
     const snap_end = while (lines.next()) |line| {
-        if (!isMultilineString(line)) {
-            break offset;
-        }
+        if (!isMultilineString(line)) break offset;
         offset += line.len + 1; // 1 for \n
-    } else unreachable;
+    } else offset;
 
-    return Range{ .start = snap_start, .end = snap_end };
+    return Range{ .start = snap_start, .end = @min(snap_end, text.len) };
+}
+
+/// Answer whether the snapshot block holds `expected`. The comparison ignores
+/// the indentation and the `\\` markers.
+fn blockMatches(block: []const u8, expected: []const u8) bool {
+    const trimmed = std.mem.trimEnd(u8, block, "\n");
+    var block_lines = std.mem.splitScalar(u8, trimmed, '\n');
+    var expected_lines = std.mem.splitScalar(u8, expected, '\n');
+
+    while (true) {
+        const block_line = block_lines.next();
+        const expected_line = expected_lines.next();
+        if (block_line == null and expected_line == null) return true;
+        if (block_line == null or expected_line == null) return false;
+        if (!std.mem.eql(u8, snapshotLineContent(block_line.?), expected_line.?)) return false;
+    }
+}
+
+/// Returns the text after the leading spaces and the `\\` marker.
+fn snapshotLineContent(line: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < line.len and line[i] == ' ') i += 1;
+    if (i + 1 < line.len and line[i] == '\\' and line[i + 1] == '\\') i += 2;
+    return line[i..];
 }
 
 fn isMultilineString(line: []const u8) bool {
@@ -515,11 +645,53 @@ fn getIndent(line: []const u8) []const u8 {
     return line;
 }
 
+test "snapshotRange finds the block below the call" {
+    const text =
+        \\fn f() void {
+        \\    try oh.snap(
+        \\        \\first
+        \\        \\second
+        \\    ).expectEqual(val);
+        \\}
+        \\
+    ;
+    const range = try snapshotRange(text, 2);
+    try testing.expectEqualStrings(
+        "        \\\\first\n        \\\\second\n",
+        text[range.start..range.end],
+    );
+}
+
+test "blockMatches ignores indentation and markers" {
+    try testing.expect(blockMatches(
+        "    \\\\first\n    \\\\second\n",
+        "first\nsecond",
+    ));
+    try testing.expect(blockMatches("    \\\\\n", ""));
+    try testing.expect(!blockMatches(
+        "    \\\\first\n    \\\\second\n",
+        "first\nother",
+    ));
+}
+
+test "ShiftTracker corrects lines which earlier updates moved" {
+    var tracker: ShiftTracker = .{};
+    defer tracker.deinit();
+
+    try tracker.record("f.zig", 10, 3);
+    try tracker.record("f.zig", 20, -1);
+
+    try testing.expectEqual(@as(i64, 0), tracker.lineDelta("f.zig", 10));
+    try testing.expectEqual(@as(i64, 3), tracker.lineDelta("f.zig", 15));
+    try testing.expectEqual(@as(i64, 2), tracker.lineDelta("f.zig", 25));
+    try testing.expectEqual(@as(i64, 0), tracker.lineDelta("g.zig", 100));
+}
+
 test "snap test" {
     // Change either the snapshot or the struct to make these tests fail
     const oh = OhSnap(default_pretty_options);
     // Simple anon struct
-    try oh.snap(@src(),
+    try oh.snap(
         \\ohsnap.test.snap test__struct_<^\d+$>
         \\  .foo: *const [10:0]u8
         \\    "bazbuxquux"
@@ -527,7 +699,6 @@ test "snap test" {
     ).expectEqual(.{ .foo = "bazbuxquux", .baz = 27 });
     // Type
     try oh.snap(
-        @src(),
         \\builtin.Type
         \\  .struct: builtin.Type.Struct
         \\    .layout: builtin.Type.ContainerLayout
@@ -574,7 +745,6 @@ test "snap regex" {
     const an_rf = RandomField.init(rand.int(u64));
     const oh = OhSnap(default_pretty_options);
     try oh.snap(
-        @src(),
         \\ohsnap.test.snap regex.RandomField
         \\  .str: []const u8
         \\    "argle<^\w+?$>gle"
@@ -608,7 +778,6 @@ test "snap with timestamp" {
         37337,
     );
     try oh.snap(
-        @src(),
         \\ohsnap.StampedStruct
         \\  .message: []const u8
         \\    "frobnicate the turbo-<^\w+$>"
@@ -633,7 +802,6 @@ test "expectEqualFmt" {
     const oh = OhSnap(default_pretty_options);
     const foobar = CustomStruct{ .foo = 42, .bar = 23 };
     try oh.snap(
-        @src(),
         \\foo! <<42>>, bar! <<23>>
         ,
     ).expectEqualFmt(foobar);
@@ -641,7 +809,7 @@ test "expectEqualFmt" {
 
 test "regex match" {
     const oh = OhSnap(default_pretty_options);
-    try oh.snap(@src(),
+    try oh.snap(
         \\?mvzr.Match
         \\  .slice: []const u8
         \\    "<^ $\d\.\d{2}$>"
