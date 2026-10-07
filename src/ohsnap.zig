@@ -259,7 +259,6 @@ pub fn Snap(comptime pretty_options: pretty.Options) type {
             );
 
             std.debug.print("Updated {s}:{d}\n", .{ file_name, call_site.line });
-            return error.SnapUpdated;
         }
 
         /// Find regex matches and modify the diff accordingly.

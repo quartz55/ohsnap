@@ -83,7 +83,7 @@ test "snap something" {
 
 The snaptest sees the `<!update>`, which must be the beginning of the string, and replaces it in your file with the output of the pretty printing.  Easy!
 
-An update needs debug info, so run the tests in Debug mode.  You can add `<!update>` to any number of snapshots.  One test run applies all of them, because `ohsnap` corrects each snapshot line for the updates already applied in that run.
+An update needs debug info, so run the tests in Debug mode.  You can add `<!update>` to any number of snapshots.  The updated test passes, and one run applies every update.  `ohsnap` corrects each snapshot line for the updates already applied in that run.
 
 If your data structure has a `.format` method, and you'd prefer to use that as a basis, simply use `.expectEqualFmt` instead of `.expectEqual`.
 
@@ -198,7 +198,7 @@ Usage note: in some cases, the changes to the new string will displace the regex
 
 ## Developing With Snapshots
 
-When we're programming, there are always points in the process where a data structure is in flux, and `ohsnap` can help you out with that as well.  Instead of `.expectEqual(var)`, use `.show(var)`, or `.showFmt(var)`.  This will print the snapshot, whether it diffs or not, and it doesn't count as a test.  `<!update>` continues to work in the same way, but an updated `.show` snapshot counts as a failed test.  Add `<!update>` to any number of snapshots and run the test suite once.  `ohsnap` applies every update in that run.
+When we're programming, there are always points in the process where a data structure is in flux, and `ohsnap` can help you out with that as well.  Instead of `.expectEqual(var)`, use `.show(var)`, or `.showFmt(var)`.  This will print the snapshot, whether it diffs or not, and it doesn't count as a test.  `<!update>` works in the same way.  Add `<!update>` to any number of snapshots and run the test suite once.  `ohsnap` applies every update in that run.
 
 This also works as a minimalist way to regress a snapshot test, when you aren't sure what the final value will be.
 
@@ -210,7 +210,7 @@ To update a snapshot, `ohsnap` must open the file which holds it.  It records th
 
 The test binary must contain debug info.  Build and run the tests in Debug mode (the default for `zig build test`).  A binary without debug info can still run the tests, but it cannot update a snapshot.  `ohsnap` prints an error in that case.
 
-An update rewrites the file, which changes the line numbers below it.  `ohsnap` tracks those changes, so one test run can update any number of snapshots.  Add `<!update>` to each snap you want to regenerate, run the tests once, then run them again to confirm.
+An update rewrites the file, which changes the line numbers below it.  `ohsnap` tracks those changes, so one test run can update any number of snapshots.  Add `<!update>` to each snap you want to regenerate, then run the tests once.
 
 ## That's It!
 
